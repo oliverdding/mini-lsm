@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -278,8 +278,24 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let guard = self.state.read();
+
+        if let Some(res) = guard.memtable.get(key) {
+            if res.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(res));
+        }
+
+        if let Some(res) = guard.imm_memtables.iter().find_map(|m| m.get(key)) {
+            if res.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(res));
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +304,43 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let size;
+        {
+            let state = self.state.read();
+            state.memtable.put(key, value)?;
+            size = state.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        let size;
+        {
+            let state = self.state.read();
+            state.memtable.put(key, b"")?;
+            size = state.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+    }
+
+    pub fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            let guard = self.state_lock.lock();
+            let state = self.state.read();
+            if state.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(state);
+                self.force_freeze_memtable(&guard)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +365,15 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let mem_table = Arc::new(MemTable::create(self.next_sst_id()));
+        {
+            let mut state = self.state.write();
+            let mut snapshot = state.as_ref().clone();
+            let old_mem_table = std::mem::replace(&mut snapshot.memtable, mem_table);
+            snapshot.imm_memtables.insert(0, old_mem_table);
+            *state = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
